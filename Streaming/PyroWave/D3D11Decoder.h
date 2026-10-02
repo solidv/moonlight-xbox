@@ -79,7 +79,16 @@ class Decoder {
 	                size_t startSegment, size_t startOffset, size_t size,
 	                bool allowTruncated = false);
 
+	// Partial-frame readiness, ported from upstream's decode_is_ready()
+	// (pyrowave_decoder.cpp 89f7e47+). `pristineBands` counts wavelet bands
+	// from the coarsest level, and `minimumPacketRatio` is the fraction of the
+	// transmitted blocks that must have arrived (0 disables the floor).
+	// `activeBlockMask` is the optional encoder sideband (bit b of word b/32
+	// set = block b was expected; masked-out blocks are ignored), or null to
+	// require every block that the bands cover.
 	bool DecodeIsReady(bool allowPartialFrame) const;
+	bool DecodeIsReady(bool allowPartialFrame, int pristineBands, float minimumPacketRatio,
+	                   const uint32_t *activeBlockMask, size_t maskWordCount) const;
 
 	// Maps the payload buffer and writes the decode unit (the segments, in
 	// decode-unit order) directly into it, then records dequant + iDWT on the
@@ -124,16 +133,32 @@ class Decoder {
 	static constexpr int kMinimumImageSize = 4 << kLevels;
 	static constexpr uint32_t kSequenceCountMask = 0x7;
 
+	// DecodeIsReady(allowPartialFrame) policy: bands counted from the coarsest
+	// level, where 3 covers decomposition levels 4 and 3 — exactly the head
+	// Sunshine protects with 50% FEC (FEC_PROTECTED_BANDS). The ratio floor is
+	// off: prefixes far below upstream's 90% default decode to a useful blur
+	// (docs/pyrowave-partial-du-design.md).
+	static constexpr int kPartialPristineBands = 3;
+	static constexpr float kPartialMinimumPacketRatio = 0.0f;
+
 	struct BlockInfo {
 		int blockOffset8x8;
 		int blockStride8x8;
 		int blockOffset32x32;
 		int blockStride32x32;
+		// BlocksX32 * blocksY32 for this band (upstream's block_count_32x32).
+		int blockCount32x32;
 	};
 
 	// Records the new block's word offset for Decode()'s upload; payload bytes
 	// are not copied here (duplicates and invalid packets append nothing).
 	bool DecodePacket(const BitstreamHeader &header, uint32_t payloadWordOffset);
+	// Port of upstream's Impl::has_pristine_bands(): true when every block that
+	// the given bands cover has data. Null blocks are rare in the coarsest
+	// bands, but when one is absent this cannot tell it from a lost block —
+	// that is what the activeBlockMask sideband (and the DecodeIsReady
+	// fallback) are for.
+	bool HasPristineBands(int bands, const uint32_t *activeBlockMask, size_t maskWordCount) const;
 	void InitBlockMeta();
 	bool CreateResources(ID3D11Device *device);
 	bool EnsurePayloadBuffer(size_t requiredBytes);
@@ -192,8 +217,9 @@ class Decoder {
 	std::vector<uint32_t> m_offsetsCpu;
 	int m_decodedBlocks = 0;
 	// Whether any packet of the current sequence started at a block index at
-	// or past m_coarseBlockEnd (see DecodeIsReady for why this proves the
-	// coarse levels are complete).
+	// or past m_coarseBlockEnd. Kept as a DecodeIsReady fallback: it also
+	// accepts frames whose coarsest blocks include null blocks that were never
+	// transmitted, which the explicit per-band check cannot see.
 	bool m_sawBlockBeyondCoarse = false;
 	int m_totalBlocksInSequence = 0;
 	uint32_t m_lastSeq = UINT32_MAX;

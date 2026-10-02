@@ -2,6 +2,7 @@
 #include "D3D11Decoder.h"
 #include "..\..\Common\DirectXHelper.h"
 #include <Utils.hpp>
+#include <cassert>
 #include <cstring>
 
 using Microsoft::WRL::ComPtr;
@@ -178,6 +179,7 @@ void Decoder::InitBlockMeta() {
 				m_blockMeta[component][level][band] = {
 					m_blockCount8x8, blocksX8,
 					m_blockCount32x32, blocksX32,
+					blocksX32 * blocksY32,
 				};
 
 				m_blockCount32x32 += blocksX32 * blocksY32;
@@ -499,26 +501,93 @@ bool Decoder::PushPacket(const PayloadSegment *segments, size_t segmentCount,
 	return true;
 }
 
-bool Decoder::DecodeIsReady(bool allowPartialFrame) const {
+// Port of upstream's PyroWave::Decoder::Impl::has_pristine_bands()
+// (pyrowave_decoder.cpp 89f7e47+). A block is missing when packetize() never
+// recorded data for it; with an activeBlockMask, a bit that is clear means the
+// encoder never expected that block, so its absence is ignored.
+bool Decoder::HasPristineBands(int bands, const uint32_t *activeBlockMask, size_t maskWordCount) const {
+	// Account for 4:2:0 where level0 will not have packets.
+	// It's somewhat meaningless to ask for pristine bands all the way up to that point though.
+	assert(bands < kLevels);
+
+	// This analysis assumes that there are no "null" blocks present. For the
+	// lowest frequency bands, that is vanishingly unlikely to happen, and
+	// worst case we get a false positive rejection.
+	const auto blockIsMissing = [&](uint32_t blockIndex) {
+		if (m_offsetsCpu[blockIndex] != UINT32_MAX)
+			return false;
+
+		uint32_t wordIndex = blockIndex / 32;
+		if (!activeBlockMask || wordIndex >= maskWordCount)
+			return true;
+
+		// If the block wasn't expected to be active anyway, just pass it through.
+		return ((activeBlockMask[wordIndex] >> (blockIndex % 32)) & 1) != 0;
+	};
+
+	for (int band = 0; band < bands; band++) {
+		for (int component = 0; component < kComponents; component++) {
+			if (band == 0) {
+				const auto &meta = m_blockMeta[component][kLevels - 1][0];
+				for (int i = 0; i < meta.blockCount32x32; i++)
+					if (blockIsMissing(meta.blockOffset32x32 + i))
+						return false;
+			} else {
+				// If we can reconstruct the LH, HL, HH bands, we can generate the
+				// higher-resolution LL band.
+				for (int highFreqBand = 1; highFreqBand < kBandsPerLevel; highFreqBand++) {
+					const auto &meta = m_blockMeta[component][kLevels - band][highFreqBand];
+					for (int i = 0; i < meta.blockCount32x32; i++)
+						if (blockIsMissing(meta.blockOffset32x32 + i))
+							return false;
+				}
+			}
+		}
+	}
+
+	return true;
+}
+
+bool Decoder::DecodeIsReady(bool allowPartialFrame, int pristineBands, float minimumPacketRatio,
+                            const uint32_t *activeBlockMask, size_t maskWordCount) const {
 	if (m_decodedFrameForCurrentSequence)
 		return false;
 	if (m_lastSeq == UINT32_MAX)
 		return false;
+
+	if (m_decodedBlocks < m_totalBlocksInSequence) {
+		if (!allowPartialFrame)
+			return false;
+		if (!HasPristineBands(pristineBands, activeBlockMask, maskWordCount))
+			return false;
+		if ((float)m_decodedBlocks <= (float)m_totalBlocksInSequence * minimumPacketRatio)
+			return false;
+	}
+
+	return true;
+}
+
+bool Decoder::DecodeIsReady(bool allowPartialFrame) const {
 	// Partial frames are worth showing as long as the coarse levels (4 and 3)
 	// are fully present: the image degrades to blur, never to garbage. A
 	// prefix carrying only ~20% of the frame's bytes decodes at ~37 dB on
 	// real game content (docs/pyrowave-partial-du-design.md), which upstream's
-	// ">half the blocks" rule would have rejected.
-	//
-	// Coverage cannot be counted directly — only blocks with data are
-	// transmitted, and the receiver has no per-level transmitted counts. But
-	// packetize() emits blocks in ascending index order and partial delivery
-	// is a byte-prefix of that stream, so having seen any packet start at or
-	// past the coarse boundary proves every transmitted coarse block arrived.
-	if (m_decodedBlocks < m_totalBlocksInSequence)
-		if (!allowPartialFrame || !m_sawBlockBeyondCoarse)
-			return false;
-	return true;
+	// ">half the blocks" rule would have rejected. Bands = 3 matches the head
+	// Sunshine protects with 50% FEC (FEC_PROTECTED_BANDS=3, levels 4 and 3).
+	if (DecodeIsReady(allowPartialFrame, kPartialPristineBands, kPartialMinimumPacketRatio, nullptr, 0))
+		return true;
+
+	// The explicit per-band check cannot tell a null block that was never
+	// transmitted from a lost one, so it can falsely reject a frame whose
+	// coarse levels are intact apart from such a block. Upstream notes the
+	// same limitation and suggests the active-block sideband as the fix;
+	// until the host sends it, fall back to the ordered-stream inference used
+	// before the port: packetize() emits blocks in ascending index order and
+	// partial delivery is a byte prefix of that stream, so a delivered prefix
+	// that reaches a packet starting at or past the coarse boundary proves
+	// every transmitted coarse block arrived.
+	return allowPartialFrame && !m_decodedFrameForCurrentSequence && m_lastSeq != UINT32_MAX &&
+	       m_decodedBlocks < m_totalBlocksInSequence && m_sawBlockBeyondCoarse;
 }
 
 void Decoder::Dequant(ID3D11DeviceContext *ctx) {
