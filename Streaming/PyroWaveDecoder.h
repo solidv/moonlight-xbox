@@ -30,8 +30,8 @@ class PyroWaveDecoder {
 	static PyroWaveDecoder &instance();
 
 	// Called before connection start (alongside FFMpegDecoder's): stashes
-	// device resources and the negotiated colorspace/range for AVFrame
-	// color fields.
+	// device resources. Color fields are host-determined (see
+	// ApplyFrameColor), so the negotiated config is not retained.
 	void CompleteInitialization(const std::shared_ptr<DX::DeviceResources> &res, STREAM_CONFIGURATION *config);
 
 	int Init(int videoFormat, int width, int height, int redrawRate);
@@ -67,8 +67,6 @@ class PyroWaveDecoder {
 	void ApplyFrameColor(AVFrame *frame);
 
 	std::shared_ptr<DX::DeviceResources> m_deviceResources;
-	int m_negColorSpace = 0;  // COLORSPACE_* from STREAM_CONFIGURATION
-	int m_negColorRange = 0;  // COLOR_RANGE_*
 
 	std::unique_ptr<PyroWaveD3D11::Decoder> m_decoder;
 	std::unique_ptr<PyroWaveD3D11::FramePool> m_pool;

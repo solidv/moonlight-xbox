@@ -20,8 +20,10 @@ PyroWaveDecoder &PyroWaveDecoder::instance() {
 
 void PyroWaveDecoder::CompleteInitialization(const std::shared_ptr<DX::DeviceResources> &res, STREAM_CONFIGURATION *config) {
 	m_deviceResources = res;
-	m_negColorSpace = config->colorSpace;
-	m_negColorRange = config->colorRange;
+	// The negotiated colorSpace/colorRange are requests PyroWave's host-side
+	// scaler ignores; ApplyFrameColor sets the AVFrame color fields from what
+	// it actually sends.
+	(void)config;
 }
 
 int PyroWaveDecoder::Init(int videoFormat_, int width_, int height_, int redrawRate) {
@@ -81,30 +83,19 @@ void PyroWaveDecoder::Cleanup() {
 }
 
 void PyroWaveDecoder::ApplyFrameColor(AVFrame *frame) {
-	// Color metadata comes from protocol negotiation (like the FFmpeg path
-	// reads it from the codec), NOT from the pyrowave bitstream bits, which
-	// today's encoder never sets.
-	switch (m_negColorSpace) {
-	case COLORSPACE_REC_709:
-		frame->colorspace = AVCOL_SPC_BT709;
-		break;
-	case COLORSPACE_REC_2020:
-		frame->colorspace = AVCOL_SPC_BT2020_NCL;
-		break;
-	default:
-		frame->colorspace = AVCOL_SPC_SMPTE170M; // Rec. 601
-		break;
-	}
-	frame->color_range = m_negColorRange == COLOR_RANGE_FULL ? AVCOL_RANGE_JPEG : AVCOL_RANGE_MPEG;
+	// PyroWave's host-side scaler always emits full-range YCbCr: BT.709 for
+	// SDR, BT.2020 NCL PQ for HDR. The bitstream can't signal that, and the
+	// negotiated colorSpace/colorRange are requests the host doesn't honor,
+	// so decode what the host actually sends.
+	frame->color_range = AVCOL_RANGE_JPEG;
 
-	// HDR: 10-bit PyroWave stream with the host in HDR mode renders as
-	// BT.2020 PQ (same convention as HEVC Main10/AV1 10-bit).
 	bool hdr = (videoFormat & VIDEO_FORMAT_MASK_10BIT) && LiGetCurrentHostDisplayHdrMode();
 	if (hdr) {
 		frame->colorspace = AVCOL_SPC_BT2020_NCL;
 		frame->color_primaries = AVCOL_PRI_BT2020;
 		frame->color_trc = AVCOL_TRC_SMPTE2084;
 	} else {
+		frame->colorspace = AVCOL_SPC_BT709;
 		frame->color_primaries = AVCOL_PRI_BT709;
 		frame->color_trc = AVCOL_TRC_BT709;
 	}

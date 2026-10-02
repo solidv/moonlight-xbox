@@ -48,13 +48,15 @@ class FramePool {
 
 	// Wraps an acquired set into an AVFrame owning it: on av_frame_free the
 	// set returns to the pool. Returns nullptr on alloc failure (the set is
-	// recycled). Caller fills pts and color fields (see ApplyColorimetry).
+	// recycled). Caller fills pts and color fields (see
+	// PyroWaveDecoder::ApplyFrameColor / ApplyColorimetry).
 	AVFrame *WrapFrame(FrameSet *set);
 
 	// Maps sequence-header colorimetry onto the AVFrame color fields the
 	// renderer/pacer read. All-zero bits are what today's encoder always
-	// sends (it never sets them); trust protocol-negotiated HDR instead when
-	// forceHdr is set.
+	// sends (it never sets them); forceHdr selects the host's HDR convention
+	// (BT.2020 NCL PQ) instead. Range is always full: the host-side scaler
+	// never emits limited-range YCbCr.
 	static void ApplyColorimetry(AVFrame *frame, const SequenceColorimetry &col, bool forceHdr);
 
 	int Width() const { return m_width; }
