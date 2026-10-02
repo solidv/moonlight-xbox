@@ -3,10 +3,11 @@
 // Moonlight-facing PyroWave decoder shim, sibling of FFMpegDecoder.
 // The DECODER_RENDERER_CALLBACKS shims in FFmpegDecoder.cpp route here when
 // the negotiated format has VIDEO_FORMAT_MASK_PYROWAVE set. Each decode unit
-// carries one frame framed as [u32 count]{[u32 size][bytes]}*; the shim
-// strips that transport framing, feeds the raw self-delimiting packets to
-// PyroWaveD3D11::Decoder, decodes into FramePool planes and hands the
-// wrapped AVFrame to Pacer (which owns it from then on; the pool recycles
+// carries one frame framed as [u32 count]{[u32 size][bytes]}*; the shim walks
+// that framing in place and feeds the raw self-delimiting packets to
+// PyroWaveD3D11::Decoder, which uploads the decode unit bytes to the GPU
+// directly (no CPU reassembly copy), decodes into FramePool planes and hands
+// the wrapped AVFrame to Pacer (which owns it from then on; the pool recycles
 // plane sets via the AVFrame free callback).
 
 #include "PyroWave\D3D11Decoder.h"
@@ -57,7 +58,7 @@ class PyroWaveDecoder {
   private:
 	// lostPercent < 0 marks a complete capture; >= 0 a partial one, tagged
 	// with that percentage in the filename.
-	void WriteCaptureAsync(size_t length, int frameNumber, int lostPercent);
+	void WriteCaptureAsync(int frameNumber, int lostPercent);
 	void WriteCapture(const uint8_t *data, size_t length, int frameNumber, int lostPercent);
 
 	PyroWaveDecoder() = default;
@@ -74,7 +75,10 @@ class PyroWaveDecoder {
 	// freed on the next Init (Pacer has long since drained them by then).
 	std::vector<std::unique_ptr<PyroWaveD3D11::FramePool>> m_retiredPools;
 
-	std::vector<uint8_t> m_duBuffer;
+	// The current decode unit as a segment view: payload bytes stay in the
+	// depacketizer's buffers and are parsed/uploaded in place. Reused across
+	// frames so steady state allocates nothing.
+	std::vector<PyroWaveD3D11::PayloadSegment> m_segments;
 	int m_LastFrameNumber = 0;
 	int64_t m_StreamEpochQpc = 0;
 	bool m_active = false;

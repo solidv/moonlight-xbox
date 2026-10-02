@@ -13,6 +13,58 @@ extern "C" {
 
 namespace moonlight_xbox_dx {
 
+namespace {
+
+// Byte cursor over the decode unit's segment list, used only for the transport
+// framing's 4-byte values. Packet bytes are parsed in place by the decoder.
+struct SegmentCursor {
+	const PyroWaveD3D11::PayloadSegment *segments;
+	size_t count;
+	size_t index = 0;
+	size_t offset = 0;
+	size_t remaining = 0;
+
+	// Advances past empty segments; false when the segment list is exhausted.
+	bool Normalize() {
+		while (index < count && offset == segments[index].size) {
+			offset = 0;
+			++index;
+		}
+		return index < count;
+	}
+
+	bool ReadU32(uint32_t &value) {
+		if (remaining < 4)
+			return false;
+		uint8_t bytes[4];
+		for (size_t i = 0; i < 4; i++) {
+			if (!Normalize())
+				return false;
+			bytes[i] = segments[index].data[offset++];
+		}
+		remaining -= 4;
+		memcpy(&value, bytes, sizeof(value));
+		return true;
+	}
+
+	bool Skip(size_t n) {
+		if (n > remaining)
+			return false;
+		remaining -= n;
+		while (n > 0) {
+			if (!Normalize())
+				return false;
+			size_t available = segments[index].size - offset;
+			size_t take = available < n ? available : n;
+			offset += take;
+			n -= take;
+		}
+		return true;
+	}
+};
+
+} // namespace
+
 PyroWaveDecoder &PyroWaveDecoder::instance() {
 	static PyroWaveDecoder inst;
 	return inst;
@@ -111,8 +163,17 @@ int PyroWaveDecoder::CaptureFrames(int count) {
 // Copies the DU and writes it on a background task; storage I/O on the decode
 // thread would stall it long enough to drop frames, and the resulting loss
 // would change what the capture is trying to study.
-void PyroWaveDecoder::WriteCaptureAsync(size_t length, int frameNumber, int lostPercent) {
-	auto copy = std::make_shared<std::vector<uint8_t>>(m_duBuffer.begin(), m_duBuffer.begin() + length);
+void PyroWaveDecoder::WriteCaptureAsync(int frameNumber, int lostPercent) {
+	// The file must hold exactly what the host framed, so flatten the segment
+	// view back into one buffer. Capture is a dev tool, so the copy is fine;
+	// only the write itself needs to stay off the decode thread.
+	auto copy = std::make_shared<std::vector<uint8_t>>();
+	size_t length = 0;
+	for (const auto &segment : m_segments)
+		length += segment.size;
+	copy->reserve(length);
+	for (const auto &segment : m_segments)
+		copy->insert(copy->end(), segment.data, segment.data + segment.size);
 	Concurrency::create_task([this, copy, frameNumber, lostPercent] {
 		// An exception escaping a discarded task takes the process down at
 		// task destruction, and this one touches WinRT storage APIs.
@@ -195,11 +256,17 @@ int PyroWaveDecoder::SubmitDecodeUnit(PDECODE_UNIT decodeUnit) {
 	if (!m_decoder || !m_pool)
 		return DR_OK;
 
-	// Reassemble the decode unit
-	m_duBuffer.resize(decodeUnit->fullLength);
+	// Build a segment view of the decode unit. Nothing is copied: the decoder
+	// parses the packet stream in place and Decode() uploads these same bytes
+	// straight into the payload buffer.
+	m_segments.clear();
 	size_t length = 0;
 	for (PLENTRY entry = decodeUnit->bufferList; entry != NULL; entry = entry->next) {
-		memcpy(m_duBuffer.data() + length, entry->data, entry->length);
+		PyroWaveD3D11::PayloadSegment segment;
+		segment.data = reinterpret_cast<const uint8_t *>(entry->data);
+		segment.size = (uint32_t)entry->length;
+		segment.offset = (uint32_t)length;
+		m_segments.push_back(segment);
 		length += entry->length;
 	}
 
@@ -239,36 +306,41 @@ int PyroWaveDecoder::SubmitDecodeUnit(PDECODE_UNIT decodeUnit) {
 	// rest of the burst captures.
 	if (!partial && m_captureFramesRemaining.load(std::memory_order_relaxed) > 0) {
 		m_captureFramesRemaining.fetch_sub(1, std::memory_order_relaxed);
-		WriteCaptureAsync(length, decodeUnit->frameNumber, -1);
+		WriteCaptureAsync(decodeUnit->frameNumber, -1);
 	}
 
 	// Strip the transport framing: [u32 count]{[u32 size][bytes]}*.
 	// Each sized chunk holds one or more whole self-delimiting pyrowave
-	// packets; PushPacket parses whatever it is handed.
+	// packets; PushPacket parses whatever it is handed, in place.
 	if (length < 4) {
 		Utils::Log("PyroWave live: runt decode unit\n");
 		return DR_OK;
 	}
+	SegmentCursor cursor { m_segments.data(), m_segments.size(), 0, 0, length };
 	uint32_t chunkCount;
-	memcpy(&chunkCount, m_duBuffer.data(), 4);
-	size_t pos = 4;
+	if (!cursor.ReadU32(chunkCount)) {
+		Utils::Log("PyroWave live: truncated DU framing\n");
+		return DR_OK;
+	}
 	for (uint32_t i = 0; i < chunkCount; i++) {
-		if (pos + 4 > length)
+		if (cursor.remaining < 4)
 			break;
 		uint32_t sz;
-		memcpy(&sz, m_duBuffer.data() + pos, 4);
-		pos += 4;
-		if (pos + sz > length) {
+		if (!cursor.ReadU32(sz))
+			break;
+		if (sz > cursor.remaining) {
 			// Truncated final chunk. It can still hold whole pyrowave packets
 			// ahead of the cut, so decode as far as the data goes.
 			if (partial)
-				m_decoder->PushPacket(m_duBuffer.data() + pos, length - pos, true);
+				m_decoder->PushPacket(m_segments.data(), m_segments.size(),
+				                      cursor.index, cursor.offset, cursor.remaining, true);
 			else
 				Utils::Logf("PyroWave live: chunk %u overruns DU (frame %d)\n", i, decodeUnit->frameNumber);
 			break;
 		}
-		m_decoder->PushPacket(m_duBuffer.data() + pos, sz);
-		pos += sz;
+		m_decoder->PushPacket(m_segments.data(), m_segments.size(),
+		                      cursor.index, cursor.offset, sz);
+		cursor.Skip(sz);
 	}
 
 	if (!m_decoder->DecodeIsReady(partial)) {
@@ -294,7 +366,7 @@ int PyroWaveDecoder::SubmitDecodeUnit(PDECODE_UNIT decodeUnit) {
 		int lostPercent = totalBlocks > 0
 		    ? 100 - (100 * m_decoder->DecodedBlocks()) / totalBlocks
 		    : 0;
-		WriteCaptureAsync(length, decodeUnit->frameNumber, lostPercent);
+		WriteCaptureAsync(decodeUnit->frameNumber, lostPercent);
 	}
 
 	PyroWaveD3D11::FrameSet *set = m_pool->Acquire();
@@ -313,7 +385,7 @@ int PyroWaveDecoder::SubmitDecodeUnit(PDECODE_UNIT decodeUnit) {
 		// The immediate context is shared with the render thread
 		auto guard = FFMpegDecoder::Lock();
 		auto *ctx = m_deviceResources->GetD3DDeviceContext();
-		decoded = m_decoder->Decode(ctx, uavs);
+		decoded = m_decoder->Decode(ctx, uavs, m_segments.data(), m_segments.size(), length);
 		// Non-blocking: retrieves the measurement of a frame decoded a few
 		// frames ago, if the GPU has finished it.
 		haveGpuMs = m_decoder->PollGpuTimeMs(ctx, &gpuMs);

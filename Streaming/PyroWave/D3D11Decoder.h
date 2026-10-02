@@ -52,27 +52,45 @@ struct SequenceColorimetry {
 	bool valid = false;
 };
 
+// One contiguous byte range of a decode unit's buffer chain, tagged with the
+// byte offset it occupies in the GPU payload buffer. That buffer is laid out
+// exactly like the decode unit (transport framing included), so the parser
+// records word offsets into this layout and no CPU staging copy is needed.
+struct PayloadSegment {
+	const uint8_t *data;
+	uint32_t size;
+	uint32_t offset;
+};
+
 class Decoder {
   public:
 	// chroma444: true for 4:4:4 streams (all our targets), false for 4:2:0.
 	// Fails (returns false) on shader load or resource creation errors.
 	bool Init(ID3D11Device *device, int width, int height, bool chroma444);
 
-	// Feed one decode unit's worth of packet stream (self-delimiting packets).
-	// allowTruncated: the buffer is known to be cut short (partial decode unit),
+	// Parse `size` bytes of one transport chunk starting at
+	// (startSegment, startOffset) in the segment list. Packets may span
+	// segments. Only 8-byte headers are ever copied: payload bytes stay in the
+	// depacketizer's buffers until Decode() uploads them to the GPU.
+	// allowTruncated: the chunk is known to be cut short (partial decode unit),
 	// so running out of data mid-packet is expected rather than an error. Whole
 	// packets ahead of the cut are still decoded.
-	bool PushPacket(const void *data, size_t size, bool allowTruncated = false);
+	bool PushPacket(const PayloadSegment *segments, size_t segmentCount,
+	                size_t startSegment, size_t startOffset, size_t size,
+	                bool allowTruncated = false);
 
 	bool DecodeIsReady(bool allowPartialFrame) const;
 
-	// Records payload upload + dequant + iDWT on the given context.
+	// Maps the payload buffer and writes the decode unit (the segments, in
+	// decode-unit order) directly into it, then records dequant + iDWT on the
+	// given context. There is no CPU staging copy of the payload.
 	// planeUavs are the three output plane UAVs (Y, Cb, Cr), full frame
 	// resolution each for 4:4:4. They MUST be created with ViewDimension
 	// TEXTURE2DARRAY (ArraySize 1): the idwt kernel is built with
 	// OUTPUT_LAYERED and declares RWTexture2DArray. Caller must hold the
 	// device-context lock.
-	bool Decode(ID3D11DeviceContext *ctx, ID3D11UnorderedAccessView *const planeUavs[3]);
+	bool Decode(ID3D11DeviceContext *ctx, ID3D11UnorderedAccessView *const planeUavs[3],
+	            const PayloadSegment *segments, size_t segmentCount, size_t totalBytes);
 
 	// Reset all sequence state (stream restart).
 	void Clear();
@@ -113,7 +131,9 @@ class Decoder {
 		int blockStride32x32;
 	};
 
-	bool DecodePacket(const BitstreamHeader *header);
+	// Records the new block's word offset for Decode()'s upload; payload bytes
+	// are not copied here (duplicates and invalid packets append nothing).
+	bool DecodePacket(const BitstreamHeader &header, uint32_t payloadWordOffset);
 	void InitBlockMeta();
 	bool CreateResources(ID3D11Device *device);
 	bool EnsurePayloadBuffer(size_t requiredBytes);
@@ -170,7 +190,6 @@ class Decoder {
 
 	// CPU-side state (mirrors upstream Impl)
 	std::vector<uint32_t> m_offsetsCpu;
-	std::vector<uint32_t> m_payloadCpu;
 	int m_decodedBlocks = 0;
 	// Whether any packet of the current sequence started at a block index at
 	// or past m_coarseBlockEnd (see DecodeIsReady for why this proves the

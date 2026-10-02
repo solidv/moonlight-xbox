@@ -2,6 +2,7 @@
 #include "D3D11Decoder.h"
 #include "..\..\Common\DirectXHelper.h"
 #include <Utils.hpp>
+#include <cstring>
 
 using Microsoft::WRL::ComPtr;
 
@@ -30,6 +31,79 @@ namespace {
 	}
 
 	enum { kStartOfFrame = 0 }; // BITSTREAM_EXTENDED_CODE_START_OF_FRAME
+
+	// Byte cursor over a decode unit's segment list. It copies only 8-byte
+	// headers, never payload bytes, so the decoder can parse straight from the
+	// depacketizer's buffers and Decode() can upload them without a staging
+	// copy. Positions are (segmentIndex, offsetInSegment); a packet may span
+	// segments.
+	class SegmentReader {
+	  public:
+		SegmentReader(const PayloadSegment *segments, size_t segmentCount,
+		              size_t segmentIndex, size_t segmentOffset, size_t size)
+		    : m_segments(segments), m_segmentCount(segmentCount),
+		      m_segmentIndex(segmentIndex), m_segmentOffset(segmentOffset), m_remaining(size) {}
+
+		size_t Remaining() const { return m_remaining; }
+
+		// Byte offset of the current position within the payload buffer.
+		uint32_t DestOffset() const {
+			return m_segments[m_segmentIndex].offset + (uint32_t)m_segmentOffset;
+		}
+
+		// Copies `count` bytes out of the stream, crossing segment boundaries.
+		bool Read(void *dst, size_t count) {
+			if (count > m_remaining)
+				return false;
+			auto *out = static_cast<uint8_t *>(dst);
+			while (count > 0) {
+				if (!Normalize())
+					return false;
+				const PayloadSegment &segment = m_segments[m_segmentIndex];
+				size_t available = segment.size - m_segmentOffset;
+				size_t take = available < count ? available : count;
+				memcpy(out, segment.data + m_segmentOffset, take);
+				out += take;
+				m_segmentOffset += take;
+				m_remaining -= take;
+				count -= take;
+			}
+			return true;
+		}
+
+		// Skips `count` bytes of the stream.
+		bool Skip(size_t count) {
+			if (count > m_remaining)
+				return false;
+			m_remaining -= count;
+			while (count > 0) {
+				if (!Normalize())
+					return false;
+				const PayloadSegment &segment = m_segments[m_segmentIndex];
+				size_t available = segment.size - m_segmentOffset;
+				size_t take = available < count ? available : count;
+				m_segmentOffset += take;
+				count -= take;
+			}
+			return true;
+		}
+
+	  private:
+		// Advances past empty segments; false when the stream is exhausted.
+		bool Normalize() {
+			while (m_segmentIndex < m_segmentCount && m_segmentOffset == m_segments[m_segmentIndex].size) {
+				m_segmentOffset = 0;
+				++m_segmentIndex;
+			}
+			return m_segmentIndex < m_segmentCount;
+		}
+
+		const PayloadSegment *m_segments;
+		size_t m_segmentCount;
+		size_t m_segmentIndex;
+		size_t m_segmentOffset;
+		size_t m_remaining;
+	};
 
 } // namespace
 
@@ -71,7 +145,6 @@ bool Decoder::Init(ID3D11Device *device, int width, int height, bool chroma444) 
 	}
 
 	m_offsetsCpu.resize(m_blockCount32x32);
-	m_payloadCpu.reserve(1024 * 1024);
 	Clear();
 
 	Utils::Logf("PyroWave: decoder init %dx%d (aligned %dx%d), %s, %d blocks\n",
@@ -251,10 +324,14 @@ bool Decoder::EnsurePayloadBuffer(size_t requiredBytes) {
 		newSize = 64 * 1024;
 	newSize = (newSize + 3) & ~size_t(3);
 
+	// DYNAMIC: Decode() maps the buffer and writes the decode unit bytes
+	// directly into it (WRITE_DISCARD), so there is no CPU staging copy and no
+	// driver-side UpdateSubresource staging either.
 	D3D11_BUFFER_DESC desc = {};
 	desc.ByteWidth = (UINT)newSize;
-	desc.Usage = D3D11_USAGE_DEFAULT;
+	desc.Usage = D3D11_USAGE_DYNAMIC;
 	desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+	desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
 	ComPtr<ID3D11Buffer> buffer;
 	DX::ThrowIfFailed(m_device->CreateBuffer(&desc, nullptr, &buffer), "payload buffer");
 
@@ -281,91 +358,107 @@ void Decoder::Clear() {
 	m_lastSeq = UINT32_MAX;
 	m_decodedFrameForCurrentSequence = false;
 	m_totalBlocksInSequence = m_blockCount32x32;
-	m_payloadCpu.clear();
 }
 
-// Port of Decoder::Impl::decode_packet
-bool Decoder::DecodePacket(const BitstreamHeader *header) {
-	auto &offset = m_offsetsCpu[header->block_index];
+// Port of Decoder::Impl::decode_packet. The payload bytes stay in the decode
+// unit; only the packet's word offset in the payload buffer is recorded, so
+// Decode() can upload the decode unit verbatim.
+bool Decoder::DecodePacket(const BitstreamHeader &header, uint32_t payloadWordOffset) {
+	auto &offset = m_offsetsCpu[header.block_index];
 	if (offset == UINT32_MAX) {
 		m_decodedBlocks++;
-		offset = (uint32_t)m_payloadCpu.size();
+		offset = payloadWordOffset;
 	} else {
 		return true; // duplicate packet
 	}
 
-	if (sizeof(*header) / sizeof(uint32_t) > header->payload_words) {
+	if (sizeof(header) / sizeof(uint32_t) > header.payload_words) {
 		Utils::Log("PyroWave: payload_words is not large enough\n");
 		return false;
 	}
 
-	auto *payloadWords = reinterpret_cast<const uint32_t *>(header);
-	m_payloadCpu.insert(m_payloadCpu.end(), payloadWords, payloadWords + header->payload_words);
 	return true;
 }
 
-// Port of Decoder::Impl::push_packet
-bool Decoder::PushPacket(const void *data_, size_t size, bool allowTruncated) {
-	auto *data = static_cast<const uint8_t *>(data_);
-	while (size >= sizeof(BitstreamHeader)) {
-		auto *header = reinterpret_cast<const BitstreamHeader *>(data);
+// Port of Decoder::Impl::push_packet, over a segment list instead of one
+// contiguous buffer. The packet stream is parsed in place: only the 8-byte
+// headers are copied out, and each new block records its word offset in the
+// payload buffer (which mirrors the decode unit byte-for-byte).
+bool Decoder::PushPacket(const PayloadSegment *segments, size_t segmentCount,
+                         size_t startSegment, size_t startOffset, size_t size,
+                         bool allowTruncated) {
+	SegmentReader reader(segments, segmentCount, startSegment, startOffset, size);
 
-		if (header->extended != 0) {
-			auto *seq = reinterpret_cast<const BitstreamSequenceHeader *>(header);
+	while (reader.Remaining() >= sizeof(BitstreamHeader)) {
+		// Packet starts are word-aligned: chunk and packet sizes are multiples
+		// of 4, so a packet's byte offset in the decode unit is also its word
+		// offset in the payload buffer.
+		uint32_t packetDest = reader.DestOffset();
+		if (packetDest & 3) {
+			Utils::Log("PyroWave: unaligned packet start\n");
+			return false;
+		}
 
-			if ((seq->chroma_resolution != 0) != m_chroma444) {
+		BitstreamHeader header;
+		if (!reader.Read(&header, sizeof(header)))
+			return false;
+
+		if (header.extended != 0) {
+			BitstreamSequenceHeader seq;
+			memcpy(&seq, &header, sizeof(seq));
+
+			if ((seq.chroma_resolution != 0) != m_chroma444) {
 				Utils::Log("PyroWave: chroma resolution mismatch\n");
 				return false;
 			}
 
-			uint8_t diff = (header->sequence - m_lastSeq) & kSequenceCountMask;
+			uint8_t diff = (header.sequence - m_lastSeq) & kSequenceCountMask;
 			if (m_lastSeq != UINT32_MAX && diff > (kSequenceCountMask / 2))
 				return true; // stale sequence, ignore rest
 
 			if (m_lastSeq == UINT32_MAX || diff != 0) {
 				Clear();
-				m_lastSeq = header->sequence;
+				m_lastSeq = header.sequence;
 			}
 
-			if (seq->code == kStartOfFrame) {
-				if ((int)seq->width_minus_1 + 1 != m_width || (int)seq->height_minus_1 + 1 != m_height) {
+			if (seq.code == kStartOfFrame) {
+				if ((int)seq.width_minus_1 + 1 != m_width || (int)seq.height_minus_1 + 1 != m_height) {
 					Utils::Logf("PyroWave: dimension mismatch in seq packet (%u, %u) != (%d, %d)\n",
-					    seq->width_minus_1 + 1, seq->height_minus_1 + 1, m_width, m_height);
+					    seq.width_minus_1 + 1, seq.height_minus_1 + 1, m_width, m_height);
 					return false;
 				}
-				m_totalBlocksInSequence = (int)seq->total_blocks;
+				m_totalBlocksInSequence = (int)seq.total_blocks;
 
-				m_colorimetry.colorPrimaries = seq->color_primaries;
-				m_colorimetry.transferFunction = seq->transfer_function;
-				m_colorimetry.ycbcrTransform = seq->ycbcr_transform;
-				m_colorimetry.ycbcrRange = seq->ycbcr_range;
-				m_colorimetry.chromaSiting = seq->chroma_siting;
+				m_colorimetry.colorPrimaries = seq.color_primaries;
+				m_colorimetry.transferFunction = seq.transfer_function;
+				m_colorimetry.ycbcrTransform = seq.ycbcr_transform;
+				m_colorimetry.ycbcrRange = seq.ycbcr_range;
+				m_colorimetry.chromaSiting = seq.chroma_siting;
 				m_colorimetry.valid = true;
 			} else {
-				Utils::Logf("PyroWave: unrecognized sequence header mode %u\n", seq->code);
+				Utils::Logf("PyroWave: unrecognized sequence header mode %u\n", seq.code);
 				return false;
 			}
 
-			data += sizeof(*header);
-			size -= sizeof(*header);
 			continue;
 		}
 
-		size_t packetSize = header->payload_words * sizeof(uint32_t);
-		if (packetSize > size) {
+		size_t packetSize = header.payload_words * sizeof(uint32_t);
+		if (packetSize > sizeof(header) + reader.Remaining()) {
 			if (allowTruncated) {
 				// Even the truncated packet's header is evidence for the
 				// partial-frame readiness rule: packets arrive in ascending
 				// block-index order, so a packet starting past the coarse
 				// levels proves every transmitted coarse block came before it.
 				if (m_lastSeq != UINT32_MAX &&
-				    ((header->sequence - m_lastSeq) & kSequenceCountMask) == 0 &&
-				    header->block_index < (uint32_t)m_blockCount32x32 &&
-				    header->block_index >= (uint32_t)m_coarseBlockEnd)
+				    ((header.sequence - m_lastSeq) & kSequenceCountMask) == 0 &&
+				    header.block_index < (uint32_t)m_blockCount32x32 &&
+				    header.block_index >= (uint32_t)m_coarseBlockEnd)
 					m_sawBlockBeyondCoarse = true;
 				return true; // cut off mid-packet; keep what we decoded
 			}
-			Utils::Logf("PyroWave: packet header states %zu bytes, but only %zu left\n", packetSize, size);
+			Utils::Logf("PyroWave: packet header states %zu bytes, but only %zu left\n",
+			    packetSize, sizeof(header) + reader.Remaining());
 			return false;
 		}
 
@@ -373,7 +466,7 @@ bool Decoder::PushPacket(const void *data_, size_t size, bool allowTruncated) {
 		if (m_lastSeq == UINT32_MAX) {
 			restart = true;
 		} else {
-			uint8_t diff = (header->sequence - m_lastSeq) & kSequenceCountMask;
+			uint8_t diff = (header.sequence - m_lastSeq) & kSequenceCountMask;
 			if (diff > (kSequenceCountMask / 2))
 				return true; // stale
 			restart = diff != 0;
@@ -381,25 +474,25 @@ bool Decoder::PushPacket(const void *data_, size_t size, bool allowTruncated) {
 
 		if (restart) {
 			Clear();
-			m_lastSeq = header->sequence;
+			m_lastSeq = header.sequence;
 		}
 
-		if (header->block_index >= (uint32_t)m_blockCount32x32) {
-			Utils::Logf("PyroWave: block_index %u out of bounds (>= %d)\n", header->block_index, m_blockCount32x32);
+		if (header.block_index >= (uint32_t)m_blockCount32x32) {
+			Utils::Logf("PyroWave: block_index %u out of bounds (>= %d)\n", header.block_index, m_blockCount32x32);
 			return false;
 		}
 
-		if (header->block_index >= (uint32_t)m_coarseBlockEnd)
+		if (header.block_index >= (uint32_t)m_coarseBlockEnd)
 			m_sawBlockBeyondCoarse = true;
 
-		if (!DecodePacket(header))
+		if (!DecodePacket(header, packetDest / (uint32_t)sizeof(uint32_t)))
 			return false;
 
-		data += packetSize;
-		size -= packetSize;
+		if (!reader.Skip(packetSize - sizeof(header)))
+			return false;
 	}
 
-	if (size != 0 && !allowTruncated) {
+	if (reader.Remaining() != 0 && !allowTruncated) {
 		Utils::Log("PyroWave: did not consume packet completely\n");
 		return false;
 	}
@@ -491,10 +584,13 @@ void Decoder::Idwt(ID3D11DeviceContext *ctx, ID3D11UnorderedAccessView *const pl
 	}
 }
 
-bool Decoder::Decode(ID3D11DeviceContext *ctx, ID3D11UnorderedAccessView *const planeUavs[3]) {
-	// Uploads
-	size_t payloadBytes = m_payloadCpu.size() * sizeof(uint32_t);
-	if (!EnsurePayloadBuffer(payloadBytes))
+bool Decoder::Decode(ID3D11DeviceContext *ctx, ID3D11UnorderedAccessView *const planeUavs[3],
+                     const PayloadSegment *segments, size_t segmentCount, size_t totalBytes) {
+	// Uploads. The payload buffer is laid out exactly like the decode unit
+	// (transport framing included) and the packet offsets index into that
+	// layout, so the whole unit is copied once, straight into mapped GPU
+	// memory; the framing bytes between packets are never referenced.
+	if (!EnsurePayloadBuffer(totalBytes))
 		return false;
 
 	// Time this frame's decode on the GPU if a ring slot is free (skipping
@@ -506,9 +602,15 @@ bool Decoder::Decode(ID3D11DeviceContext *ctx, ID3D11UnorderedAccessView *const 
 		ctx->End(slot.tsBegin.Get());
 	}
 
-	if (payloadBytes) {
-		D3D11_BOX box = { 0, 0, 0, (UINT)payloadBytes, 1, 1 };
-		ctx->UpdateSubresource(m_payloadBuffer.Get(), 0, &box, m_payloadCpu.data(), 0, 0);
+	if (totalBytes) {
+		D3D11_MAPPED_SUBRESOURCE mapped = {};
+		DX::ThrowIfFailed(ctx->Map(m_payloadBuffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped), "payload map");
+		auto *dst = static_cast<uint8_t *>(mapped.pData);
+		for (size_t i = 0; i < segmentCount; i++) {
+			if (segments[i].size)
+				memcpy(dst + segments[i].offset, segments[i].data, segments[i].size);
+		}
+		ctx->Unmap(m_payloadBuffer.Get(), 0);
 	}
 	ctx->UpdateSubresource(m_offsetsBuffer.Get(), 0, nullptr, m_offsetsCpu.data(), 0, 0);
 
