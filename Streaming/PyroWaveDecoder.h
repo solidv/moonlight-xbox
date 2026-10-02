@@ -3,12 +3,15 @@
 // Moonlight-facing PyroWave decoder shim, sibling of FFMpegDecoder.
 // The DECODER_RENDERER_CALLBACKS shims in FFmpegDecoder.cpp route here when
 // the negotiated format has VIDEO_FORMAT_MASK_PYROWAVE set. Each decode unit
-// carries one frame framed as [u32 count]{[u32 size][bytes]}*; the shim walks
-// that framing in place and feeds the raw self-delimiting packets to
-// PyroWaveD3D11::Decoder, which uploads the decode unit bytes to the GPU
-// directly (no CPU reassembly copy), decodes into FramePool planes and hands
-// the wrapped AVFrame to Pacer (which owns it from then on; the pool recycles
-// plane sets via the AVFrame free callback).
+// carries one frame framed as [u32 count]{[u32 size][bytes]}*; when the
+// active-block sideband was negotiated in the ANNOUNCE, [u32 mask_words]
+// [mask_words * u32] follows the count, holding the mask of transmitted
+// blocks in the FEC-protected bands (see SubmitDecodeUnit). The shim walks
+// that framing in place and feeds the raw self-delimiting packets to PyroWaveD3D11::Decoder,
+// which uploads the decode unit bytes to the GPU directly (no CPU reassembly
+// copy), decodes into FramePool planes and hands the wrapped AVFrame to Pacer
+// (which owns it from then on; the pool recycles plane sets via the AVFrame
+// free callback).
 
 #include "PyroWave\D3D11Decoder.h"
 #include "PyroWave\FramePool.h"
@@ -79,6 +82,14 @@ class PyroWaveDecoder {
 	// depacketizer's buffers and are parsed/uploaded in place. Reused across
 	// frames so steady state allocates nothing.
 	std::vector<PyroWaveD3D11::PayloadSegment> m_segments;
+
+	// Active-block sideband, negotiated via the LI_FF/ML_FF bit
+	// PYROWAVE_ACTIVE_BLOCK_MASK and resolved in Init. When set, the mask of
+	// transmitted blocks in the FEC-protected bands follows the packet count in
+	// each decode unit and is handed to Decoder::DecodeIsReady(), which can then
+	// tell a coarse block the encoder never transmitted from a lost one.
+	bool m_activeBlockSideband = false;
+	std::vector<uint32_t> m_activeMask;
 	int m_LastFrameNumber = 0;
 	int64_t m_StreamEpochQpc = 0;
 	bool m_active = false;

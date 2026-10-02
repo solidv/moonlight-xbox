@@ -15,6 +15,11 @@ namespace moonlight_xbox_dx {
 
 namespace {
 
+// Sanity cap for the active-block mask header: 4096 words covers 128K blocks,
+// far beyond any real frame (a 4K 4:4:4 frame's protected bands are a few tens
+// of words).
+constexpr uint32_t kMaxActiveMaskWords = 4096;
+
 // Byte cursor over the decode unit's segment list, used only for the transport
 // framing's 4-byte values. Packet bytes are parsed in place by the decoder.
 struct SegmentCursor {
@@ -86,6 +91,11 @@ int PyroWaveDecoder::Init(int videoFormat_, int width_, int height_, int redrawR
 	height = height_;
 	m_LastFrameNumber = 0;
 	m_StreamEpochQpc = 0;
+	// The host advertised the sideband in the DESCRIBE reply and common-c
+	// requested it back in the ANNOUNCE, so the host feature bit is also what
+	// says whether this session's frames carry the mask.
+	m_activeBlockSideband = (LiGetHostFeatureFlags() & LI_FF_PYROWAVE_ACTIVE_BLOCK_MASK) != 0;
+	m_activeMask.clear();
 	// Don't let a capture armed at the end of one session fire in the next.
 	m_captureFramesRemaining.store(0, std::memory_order_relaxed);
 	// Auto-save the first few partial frames each stream for offline review.
@@ -114,8 +124,9 @@ int PyroWaveDecoder::Init(int videoFormat_, int width_, int height_, int redrawR
 	}
 
 	m_active = true;
-	Utils::Logf("PyroWave live: init %dx%d %s, format 0x%04x\n",
-	            width, height, chroma444 ? "4:4:4" : "4:2:0", videoFormat);
+	Utils::Logf("PyroWave live: init %dx%d %s, format 0x%04x%s\n",
+	            width, height, chroma444 ? "4:4:4" : "4:2:0", videoFormat,
+	            m_activeBlockSideband ? ", active-block sideband" : "");
 	return 0;
 }
 
@@ -309,9 +320,10 @@ int PyroWaveDecoder::SubmitDecodeUnit(PDECODE_UNIT decodeUnit) {
 		WriteCaptureAsync(decodeUnit->frameNumber, -1);
 	}
 
-	// Strip the transport framing: [u32 count]{[u32 size][bytes]}*.
-	// Each sized chunk holds one or more whole self-delimiting pyrowave
-	// packets; PushPacket parses whatever it is handed, in place.
+	// Strip the transport framing: [u32 count]{[u32 size][bytes]}*. When the
+	// active-block sideband is negotiated, [u32 mask_words][mask_words * u32]
+	// follows the count. Each sized chunk holds one or more whole self-delimiting
+	// pyrowave packets; PushPacket parses whatever it is handed, in place.
 	if (length < 4) {
 		Utils::Log("PyroWave live: runt decode unit\n");
 		return DR_OK;
@@ -322,6 +334,31 @@ int PyroWaveDecoder::SubmitDecodeUnit(PDECODE_UNIT decodeUnit) {
 		Utils::Log("PyroWave live: truncated DU framing\n");
 		return DR_OK;
 	}
+
+	// Mask of transmitted blocks in the FEC-protected bands. It rides inside
+	// the host's FEC-protected head, so only a lost first packet or unrecovered
+	// head loss keeps it from arriving; a zero word count means the host could
+	// not compute it, which leaves the decoder on its conservative path.
+	m_activeMask.clear();
+	uint32_t maskWords = 0;
+	if (m_activeBlockSideband) {
+		if (!cursor.ReadU32(maskWords) || maskWords > kMaxActiveMaskWords ||
+		    maskWords > cursor.remaining / sizeof(uint32_t)) {
+			Utils::Log("PyroWave live: malformed active-block mask header\n");
+			m_decoder->Clear();
+			return DR_OK;
+		}
+		m_activeMask.resize(maskWords);
+		for (uint32_t i = 0; i < maskWords; i++) {
+			if (!cursor.ReadU32(m_activeMask[i])) {
+				Utils::Log("PyroWave live: truncated active-block mask\n");
+				m_activeMask.clear();
+				m_decoder->Clear();
+				return DR_OK;
+			}
+		}
+	}
+
 	for (uint32_t i = 0; i < chunkCount; i++) {
 		if (cursor.remaining < 4)
 			break;
@@ -343,7 +380,17 @@ int PyroWaveDecoder::SubmitDecodeUnit(PDECODE_UNIT decodeUnit) {
 		cursor.Skip(sz);
 	}
 
-	if (!m_decoder->DecodeIsReady(partial)) {
+	// With the sideband, the explicit per-band check is authoritative: the mask
+	// tells a block the encoder never transmitted from a lost one, so no
+	// ordered-stream fallback is needed. With no mask (not negotiated, or the
+	// host reported a zero word count), fall back to the inference-based
+	// overload.
+	bool ready = m_activeBlockSideband && maskWords > 0
+	    ? m_decoder->DecodeIsReady(partial, PyroWaveD3D11::Decoder::kPartialPristineBands,
+	                               PyroWaveD3D11::Decoder::kPartialMinimumPacketRatio,
+	                               m_activeMask.data(), m_activeMask.size())
+	    : m_decoder->DecodeIsReady(partial);
+	if (!ready) {
 		// For a complete DU this should not happen. For a partial one it just
 		// means too little of the frame survived to be worth showing (the
 		// decoder requires the coarse wavelet levels, 4 and 3, to be fully

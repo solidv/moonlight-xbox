@@ -90,6 +90,14 @@ class Decoder {
 	bool DecodeIsReady(bool allowPartialFrame, int pristineBands, float minimumPacketRatio,
 	                   const uint32_t *activeBlockMask, size_t maskWordCount) const;
 
+	// Policy applied by DecodeIsReady(allowPartialFrame) and by callers that
+	// supply the active-block mask: bands counted from the coarsest level, where
+	// 3 covers decomposition levels 4 and 3 — exactly the head Sunshine protects
+	// with 50% FEC (FEC_PROTECTED_BANDS). The ratio floor is off: prefixes far
+	// below upstream's 90% default decode to a useful blur.
+	static constexpr int kPartialPristineBands = 3;
+	static constexpr float kPartialMinimumPacketRatio = 0.0f;
+
 	// Maps the payload buffer and writes the decode unit (the segments, in
 	// decode-unit order) directly into it, then records dequant + iDWT on the
 	// given context. There is no CPU staging copy of the payload.
@@ -132,14 +140,6 @@ class Decoder {
 	static constexpr int kAlignment = 1 << kLevels;
 	static constexpr int kMinimumImageSize = 4 << kLevels;
 	static constexpr uint32_t kSequenceCountMask = 0x7;
-
-	// DecodeIsReady(allowPartialFrame) policy: bands counted from the coarsest
-	// level, where 3 covers decomposition levels 4 and 3 — exactly the head
-	// Sunshine protects with 50% FEC (FEC_PROTECTED_BANDS). The ratio floor is
-	// off: prefixes far below upstream's 90% default decode to a useful blur
-	// (docs/pyrowave-partial-du-design.md).
-	static constexpr int kPartialPristineBands = 3;
-	static constexpr float kPartialMinimumPacketRatio = 0.0f;
 
 	struct BlockInfo {
 		int blockOffset8x8;
